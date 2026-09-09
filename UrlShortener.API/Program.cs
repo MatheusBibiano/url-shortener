@@ -16,10 +16,16 @@ builder.Services.AddSingleton<HashSet<string>>(_ =>
     return new HashSet<string>(domains, StringComparer.OrdinalIgnoreCase);
 });
 
-builder.Services.AddSingleton<IConnectionMultiplexer>(_ => 
+builder.Services.AddKeyedSingleton<IConnectionMultiplexer>("RedisIncr", (_, _) => 
     ConnectionMultiplexer.Connect(
         builder.Configuration.GetValue<string>("RedisIncr:ConnectionString")!)
-    );
+);
+
+builder.Services.AddKeyedSingleton<IConnectionMultiplexer>("RedisCache", (_, _) => 
+    ConnectionMultiplexer.Connect(
+        builder.Configuration.GetValue<string>("RedisCache:ConnectionString")!)
+);
+
 
 builder.Services.AddSingleton<Cassandra.ISession>(_ =>
 {
@@ -64,7 +70,7 @@ app.UseHttpsRedirection();
 app.MapPost("/shorten", async (
     [FromBody] ShortenRequest request,
     IConfiguration configuration,
-    IConnectionMultiplexer connection,
+    [FromKeyedServices("RedisIncr")] IConnectionMultiplexer incrConnection,
     Cassandra.ISession cassandraSession,
     HashSet<string> blockedDomains,
     HttpContext httpContext) =>
@@ -87,9 +93,9 @@ app.MapPost("/shorten", async (
     var key = configuration.GetValue<string>("RedisIncr:Key");
     var salt = configuration.GetValue<string>("HashId:Salt");
     var hashLength = configuration.GetValue<int>("HashId:Length");
-    var table = builder.Configuration.GetValue<string>("Cassandra:Table");
+    var table = configuration.GetValue<string>("Cassandra:Table");
     
-    var redis = connection.GetDatabase();
+    var redis = incrConnection.GetDatabase();
     var id = await redis.StringIncrementAsync(key);
     var hashids = new Hashids(salt, hashLength);
     var shortenCode = hashids.EncodeLong(id);
@@ -104,9 +110,19 @@ app.MapPost("/shorten", async (
     return Results.Created(string.Empty, new { shortUrl });
 });
 
-app.MapGet("/{shortenCode}", async (string shortenCode, Cassandra.ISession cassandraSession) =>
+app.MapGet("/{shortenCode}", async (
+    string shortenCode,
+    IConfiguration configuration,
+    Cassandra.ISession cassandraSession,
+    [FromKeyedServices("RedisCache")] IConnectionMultiplexer cacheConnection) =>
 {
-    var table = builder.Configuration.GetValue<string>("Cassandra:Table");
+    var redisCache = cacheConnection.GetDatabase();
+    
+    string? cachedLongUrl = await redisCache.StringGetAsync(shortenCode);
+    if (!string.IsNullOrEmpty(cachedLongUrl))
+        return Results.Redirect(cachedLongUrl);
+    
+    var table = configuration.GetValue<string>("Cassandra:Table");
     
     var statement = await cassandraSession.PrepareAsync(
         $"SELECT long_url FROM {table} WHERE short_code = ?"
@@ -118,6 +134,9 @@ app.MapGet("/{shortenCode}", async (string shortenCode, Cassandra.ISession cassa
         return Results.NotFound(new { error = "URL not found" });
 
     var longUrl = row.GetValue<string>("long_url");
+    
+    var ttlHours = configuration.GetValue<int?>("RedisCache:TtlHours") ?? 24;
+    await redisCache.StringSetAsync(shortenCode, longUrl, TimeSpan.FromHours(ttlHours));
     
     return Results.Redirect(longUrl);
 });
