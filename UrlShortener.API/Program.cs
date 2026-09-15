@@ -3,6 +3,7 @@ using HashidsNet;
 using Microsoft.AspNetCore.Mvc;
 using Scalar.AspNetCore;
 using StackExchange.Redis;
+using UrlShortener.API;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -26,33 +27,19 @@ builder.Services.AddKeyedSingleton<IConnectionMultiplexer>("RedisCache", (_, _) 
         builder.Configuration.GetValue<string>("RedisCache:ConnectionString")!)
 );
 
+builder.Services.AddHostedService<CassandraSchemaInitializer>();
 
-builder.Services.AddSingleton<Cassandra.ISession>(_ =>
+builder.Services.AddSingleton<Cassandra.ISession>(serviceProvider =>
 {
-    var host = builder.Configuration.GetValue<string>("Cassandra:Host");
-    var port = builder.Configuration.GetValue<int>("Cassandra:Port");
-    var keySpace = builder.Configuration.GetValue<string>("Cassandra:KeySpace");
-    var table = builder.Configuration.GetValue<string>("Cassandra:Table");
-    
+    var configuration = serviceProvider.GetRequiredService<IConfiguration>();
+    var host = configuration.GetValue<string>("Cassandra:Host");
+    var port = configuration.GetValue<int>("Cassandra:Port");
+    var keySpace = configuration.GetValue<string>("Cassandra:KeySpace");
+
     var cluster = Cluster.Builder()
         .AddContactPoint(host)
         .WithPort(port)
         .Build();
-    
-    using var setupSession = cluster.Connect();
-    
-    setupSession.Execute($$"""
-        CREATE KEYSPACE IF NOT EXISTS {{keySpace}} 
-        WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
-    """);
-    
-    setupSession.Execute($"""
-        CREATE TABLE IF NOT EXISTS {keySpace}.{table} (
-            short_code text PRIMARY KEY,
-            long_url text,
-            created_at timestamp
-        );
-    """);
 
     return cluster.Connect(keySpace);
 });
